@@ -1,10 +1,10 @@
 import os
 import requests
 import yaml
-import sqlite3  # Switch to SQLite
+import sqlite3
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
-import json  # For saving product details to JSON
+import json
 import re
 
 # Configurations
@@ -23,7 +23,7 @@ PRODUCTS_PER_SUBCATEGORY = config['products_per_subcategory']
 db_connection = sqlite3.connect(DB_FILE)
 cursor = db_connection.cursor()
 
-# Create categories table
+# Create categories and products tables
 cursor.execute('''
     CREATE TABLE IF NOT EXISTS categories (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -34,7 +34,6 @@ cursor.execute('''
     );
 ''')
 
-# Create products table
 cursor.execute('''
     CREATE TABLE IF NOT EXISTS products (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -61,28 +60,30 @@ def insert_category(main_category_name, subcategory_name, subcategory_url):
         ''', (main_category_name, subcategory_name, subcategory_url))
         db_connection.commit()
 
-# Helper functions
 def get_soup(url):
+    """Fetch a webpage and parse it into a BeautifulSoup object with proper encoding."""
     response = requests.get(url)
     response.raise_for_status()
+    response.encoding = 'utf-8'  # Ensure the response is interpreted as UTF-8
     return BeautifulSoup(response.text, 'html.parser')
 
 def sanitize_filename(name):
-    return re.sub(r'[^\w\-\_\u0600-\u06FF ]', '_', name)  # Allows Persian/Arabic characters
+    """Sanitize filenames to allow Persian/Arabic characters."""
+    return re.sub(r'[^\w\-\_\u0600-\u06FF ]', '_', name)
 
 def decode_text(text):
-    try:
-        return text.encode('latin1').decode('utf-8')  # Decodes incorrectly displayed characters
-    except UnicodeEncodeError:
-        return text  # Returns the original text if decoding fails
+    """Ensure text is decoded correctly for Persian/Arabic characters."""
+    if text:
+        return text.encode('utf-8').decode('utf-8', 'ignore')  # Decode as UTF-8
+    return None
 
 def save_image(url, folder, filename):
+    """Save an image to the specified folder."""
     try:
         response = requests.get(url, stream=True)
         response.raise_for_status()
         os.makedirs(folder, exist_ok=True)
-        sanitized_filename = sanitize_filename(filename)
-        file_path = os.path.join(folder, sanitized_filename)
+        file_path = os.path.join(folder, filename)
         with open(file_path, 'wb') as f:
             for chunk in response.iter_content(1024):
                 f.write(chunk)
@@ -91,46 +92,99 @@ def save_image(url, folder, filename):
         print(f"Failed to download image: {e}")
         return None
 
-def extract_product_details(product):
-    # Extract product link
-    product_link = product.find('a', class_='wrapper primary small tonal svelte-atwtro')
-    product_url = urljoin(BASE_URL, product_link['href']) if product_link else None
+def extract_product_metadata(main_category, sub_category, product_id, product_url):
+    """Extract detailed metadata for a product."""
+    print(f"Extracting metadata for Product ID: {product_id}")
+    try:
+        soup = get_soup(product_url)
 
-    # Extract title
-    title_tag = product.find('h2', class_='title svelte-nicmne')
-    title = title_tag.text.strip() if title_tag else "No Title"
+        metadata = {
+            "product_id": product_id,
+            "url": product_url,
+            "main_category": main_category,  # Add main category
+            "sub_category": sub_category,  # Add subcategory
+            "title": None,
+            "description": None,
+            "price": None,
+            "old_price": None,
+            "discount_percentage": None,
+            "shop_url": None,
+            "shop_name": None,
+            "images": [],
+            "related_lists": []
+        }
 
-    # Extract prices
-    price_info = product.find('div', class_='price-info fanum svelte-nicmne')
-    new_price = None
-    old_price = None
-    if price_info:
-        new_price_tag = price_info.find('div', class_='price svelte-nicmne')
-        new_price = new_price_tag.text.strip() if new_price_tag else None
+        # Extract title
+        title_tag = soup.find('h1', class_='svelte-7lo6ed')
+        metadata['title'] = decode_text(title_tag.text.strip()) if title_tag else "No Title"
 
-    # Extract image URL
-    image_tag = product.find('img', class_='svelte-13ln6ur')
-    image_url = image_tag['src'] if image_tag else None
+        # Extract description
+        description_tag = soup.find('pre', class_='svelte-1j2bv51')
+        metadata['description'] = decode_text(description_tag.text.strip()) if description_tag else "No Description"
 
-    # Placeholder for description and seller info (not found in product list page)
-    description = "Description not available"
-    seller_url = "Seller URL not available"
+        # Extract price details
+        price_tag = soup.find('div', class_='price discounted svelte-1ldsyi0')
+        old_price_tag = soup.find('div', class_='old-price svelte-1ldsyi0')
+        discount_tag = soup.find('div', class_='discount-percentage svelte-1ldsyi0')
 
-    return {
-        "url": product_url,
-        "title": title,
-        "old_price": old_price,
-        "new_price": new_price,
-        "description": description,
-        "seller_url": seller_url,
-        "image_url": image_url
-    }
+        metadata['price'] = decode_text(price_tag.text.strip()) if price_tag else "No Price"
+        metadata['old_price'] = decode_text(old_price_tag.text.strip()) if old_price_tag else None
+        metadata['discount_percentage'] = decode_text(discount_tag.text.strip()) if discount_tag else None
+
+        # Extract shop details
+        shop_tag = soup.find('a', class_='shop-info svelte-7lo6ed')
+        if shop_tag:
+            metadata['shop_url'] = urljoin(BASE_URL, shop_tag['href'])
+            shop_name_tag = shop_tag.find('img')
+            if shop_name_tag and 'alt' in shop_name_tag.attrs:
+                metadata['shop_name'] = decode_text(shop_name_tag['alt'])
+            else:
+                metadata['shop_name'] = "No Shop Name"
+
+        # Extract images
+        image_tags = soup.find_all('img', class_='svelte-13ln6ur')
+        product_folder = os.path.join(ASSETS_FOLDER, sanitize_filename(main_category), sanitize_filename(sub_category), product_id)
+        os.makedirs(product_folder, exist_ok=True)
+        for img_tag in image_tags:
+            img_url = img_tag['src']
+            img_filename = os.path.basename(img_url)
+            save_image(img_url, product_folder, img_filename)
+            metadata['images'].append(os.path.join(product_folder, img_filename))
+
+        # Save related products (names only)
+        related_names = extract_related_product_names(soup)
+        metadata['related_lists'] = [{"name": name} for name in related_names]
+
+        # Save to JSON file
+        json_path = os.path.join(product_folder, f"{product_id}.json")
+        with open(json_path, 'w', encoding='utf-8') as json_file:
+            json.dump(metadata, json_file, ensure_ascii=False, indent=4)
+
+        print(f"Metadata and images for Product ID: {product_id} saved successfully.")
+
+    except Exception as e:
+        print(f"Failed to extract metadata for Product ID: {product_id}. Error: {e}")
+
+def extract_related_product_names(soup):
+    """Extract the names of related products."""
+    related_names = []
+    related_container = soup.find('div', class_='address-container svelte-7lo6ed')
+
+    if related_container:
+        description_div = related_container.find('div', class_='description svelte-7lo6ed')
+        if description_div:
+            related_list_items = description_div.find_all('li')
+            for list_item in related_list_items:
+                link_tag = list_item.find('a', class_='hover:underline')
+                if link_tag:
+                    related_names.append(decode_text(link_tag.get_text(strip=True)))
+    return related_names
 
 def crawl_categories():
+    """Crawl categories and subcategories."""
     print("Crawling categories...")
     soup = get_soup(BASE_URL)
 
-    # Extract the three subcategory sections based on their class
     subcategories_sections = soup.find_all('div', class_='subcategories hidden svelte-cjiu79')
     women_section = soup.find('div', class_='subcategories flex svelte-cjiu79')
 
@@ -138,37 +192,33 @@ def crawl_categories():
         print("Error: Could not find all required subcategories sections.")
         return
 
-    # Assign sections explicitly based on their sequence in the HTML
-    men_section = subcategories_sections[0]  # First hidden section (for men)
-    kids_section = subcategories_sections[1]  # Second hidden section (for kids)
+    men_section = subcategories_sections[0]
+    kids_section = subcategories_sections[1]
 
     categories_info = []
 
-    # Process women subcategories
     print("Processing زنانه...")
     women_subcategories = women_section.find_all('a', class_='svelte-cjiu79')
     for subcategory in women_subcategories:
-        if subcategory.find('svg'):  # Skip parent category links
+        if subcategory.find('svg'):
             continue
         subcategory_url = urljoin(BASE_URL, subcategory['href'])
         subcategory_name = decode_text(subcategory.text.strip())
         categories_info.append(("زنانه", subcategory_name, subcategory_url))
 
-    # Process men subcategories
     print("Processing مردانه...")
     men_subcategories = men_section.find_all('a', class_='svelte-cjiu79')
     for subcategory in men_subcategories:
-        if subcategory.find('svg'):  # Skip parent category links
+        if subcategory.find('svg'):
             continue
         subcategory_url = urljoin(BASE_URL, subcategory['href'])
         subcategory_name = decode_text(subcategory.text.strip())
         categories_info.append(("مردانه", subcategory_name, subcategory_url))
 
-    # Process kids subcategories
     print("Processing بچه گانه...")
     kids_subcategories = kids_section.find_all('a', class_='svelte-cjiu79')
     for subcategory in kids_subcategories:
-        if subcategory.find('svg'):  # Skip parent category links
+        if subcategory.find('svg'):
             continue
         subcategory_url = urljoin(BASE_URL, subcategory['href'])
         subcategory_name = decode_text(subcategory.text.strip())
@@ -194,6 +244,7 @@ def crawl_categories():
         crawl_products_for_category(main_category_name, subcategory_name, subcategory_url)
 
 def crawl_products_for_category(main_category, sub_category, category_url):
+    """Crawl products for a specific category."""
     page = 1
     crawled_products = 0
 
@@ -210,46 +261,17 @@ def crawl_products_for_category(main_category, sub_category, category_url):
             if crawled_products >= PRODUCTS_PER_SUBCATEGORY:
                 break
 
-            details = extract_product_details(product)
-            if details["url"]:
-                print(f"    Crawling Product: {details['url']}")
-                save_product(main_category, sub_category, details)
-                crawled_products += 1
+            product_link = product.find('a', class_='wrapper primary small tonal svelte-atwtro')
+            if not product_link:
+                continue
+
+            product_url = urljoin(BASE_URL, product_link['href'])
+            product_id = product_url.split('/')[-1]
+
+            extract_product_metadata(main_category, sub_category, product_id, product_url)
+            crawled_products += 1
 
         page += 1
-
-def save_product(main_category, sub_category, details):
-    product_id = details['url'].split('/')[-1]  # Extract ID from URL
-
-    # Save images
-    if details['image_url']:
-        folder = os.path.join(ASSETS_FOLDER, sanitize_filename(main_category), sanitize_filename(sub_category))
-        os.makedirs(folder, exist_ok=True)
-        save_image(details['image_url'], folder, f"{product_id}.jpg")
-
-    # Save to database
-    cursor.execute('''
-        INSERT INTO products (
-            main_category, sub_category, title, old_price, new_price, description, seller_url, image_folder, json_path
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ''', (
-        main_category,
-        sub_category,
-        details['title'],
-        details['old_price'],
-        details['new_price'],
-        details['description'],
-        details['seller_url'],
-        folder,
-        os.path.join(folder, f"{product_id}.json")
-    ))
-
-    # Save to JSON
-    with open(os.path.join(folder, f"{product_id}.json"), 'w') as f:
-        json.dump(details, f)
-
-    db_connection.commit()
-
 
 if __name__ == "__main__":
     crawl_categories()
